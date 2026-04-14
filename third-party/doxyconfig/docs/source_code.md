@@ -103,8 +103,8 @@ enum class MyEnum
 * @verbatim@attention Attention needed.@endverbatim
   @attention Attention needed.
 
-* @verbatim**Important:** An important message.@endverbatim
-  **Important:** An important message.
+* @verbatim@important An important message.@endverbatim
+  @important An important message.
 
 * @verbatim@note A note.@endverbatim
   @note A note.
@@ -176,8 +176,8 @@ We have defined some custom aliases to simplify documenting examples.
     @error{Does not compute.}
   * \@hint{Content}
     @hint{Insulators insulate, until they are subject to ______ voltage.}
-  * \**Important:**{Content}
-    **Important:**{Tech is not neutral, nor is it apolitical.}
+  * \@important{Content}
+    @important{Tech is not neutral, nor is it apolitical.}
   * \@note{Content}
     @note{This is a note.}
   * \@seealso{Content}
