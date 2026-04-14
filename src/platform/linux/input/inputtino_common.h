@@ -4,16 +4,44 @@
  */
 #pragma once
 
-// lib includes
-#include <boost/locale.hpp>
-#include <inputtino/input.hpp>
-#include <libevdev/libevdev.h>
-
 // local includes
 #include "src/config.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
 #include "src/utility.h"
+
+// lib includes
+#include <boost/locale.hpp>
+
+// Limelight.h/common.h define macros globais como SPECIAL_FLAG,
+// PADDLE1_FLAG, TOUCHPAD_FLAG e MISC_FLAG. Esses nomes colidem com
+// os enumeradores do inputtino::Joypad, então limpamos as macros
+// antes de incluir <inputtino/input.hpp>. O inputtino upstream usa
+// exatamente esses enumeradores. :contentReference[oaicite:0]{index=0}
+#ifdef SPECIAL_FLAG
+#undef SPECIAL_FLAG
+#endif
+#ifdef PADDLE1_FLAG
+#undef PADDLE1_FLAG
+#endif
+#ifdef PADDLE2_FLAG
+#undef PADDLE2_FLAG
+#endif
+#ifdef PADDLE3_FLAG
+#undef PADDLE3_FLAG
+#endif
+#ifdef PADDLE4_FLAG
+#undef PADDLE4_FLAG
+#endif
+#ifdef TOUCHPAD_FLAG
+#undef TOUCHPAD_FLAG
+#endif
+#ifdef MISC_FLAG
+#undef MISC_FLAG
+#endif
+
+#include <inputtino/input.hpp>
+#include <libevdev/libevdev.h>
 
 using namespace std::literals;
 
@@ -99,4 +127,5 @@ namespace platf {
   inline float deg2rad(float degree) {
     return degree * (M_PI / 180.f);
   }
+
 }  // namespace platf
