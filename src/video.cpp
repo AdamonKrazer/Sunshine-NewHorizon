@@ -949,7 +949,6 @@ namespace video {
     },
     LIMITED_GOP_SIZE | PARALLEL_ENCODING | NO_RC_BUF_LIMIT
   };
-
   encoder_t mediacodec_h264 {
     "mediacodec_h264"sv,
     std::make_unique<encoder_platform_formats_avcodec>(
@@ -963,13 +962,30 @@ namespace video {
       nullptr
     ),
     {
-      {
-      },
-      {},
-      {},
-      {},
-      {},
-      {},
+      {},  // Common options
+      {},  // SDR-specific options
+      {},  // HDR-specific options
+      {},  // YUV444 SDR-specific options
+      {},  // YUV444 HDR-specific options
+      {},  // Fallback options
+      {},  // AV1 encoder name vazio
+    },
+    {
+      {},  // Common options
+      {},  // SDR-specific options
+      {},  // HDR-specific options
+      {},  // YUV444 SDR-specific options
+      {},  // YUV444 HDR-specific options
+      {},  // Fallback options
+      {},  // HEVC encoder name vazio
+    },
+    {
+      {},  // Common options
+      {},  // SDR-specific options
+      {},  // HDR-specific options
+      {},  // YUV444 SDR-specific options
+      {},  // YUV444 HDR-specific options
+      {},  // Fallback options
       "h264_mediacodec"s,
     },
     H264_ONLY | ALWAYS_REPROBE

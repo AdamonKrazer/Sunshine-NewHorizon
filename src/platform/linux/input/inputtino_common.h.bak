@@ -13,6 +13,11 @@
 // lib includes
 #include <boost/locale.hpp>
 
+// Limelight.h/common.h define macros globais como SPECIAL_FLAG,
+// PADDLE1_FLAG, TOUCHPAD_FLAG e MISC_FLAG. Esses nomes colidem com
+// os enumeradores do inputtino::Joypad, então limpamos as macros
+// antes de incluir <inputtino/input.hpp>. O inputtino upstream usa
+// exatamente esses enumeradores. :contentReference[oaicite:0]{index=0}
 #ifdef SPECIAL_FLAG
 #undef SPECIAL_FLAG
 #endif
@@ -38,13 +43,6 @@
 #include <inputtino/input.hpp>
 #include <libevdev/libevdev.h>
 
-// local includes
-// lib includes
-// Limelight.h/common.h define macros globais como SPECIAL_FLAG,
-// PADDLE1_FLAG, TOUCHPAD_FLAG e MISC_FLAG. Esses nomes colidem com
-// os enumeradores do inputtino::Joypad, então limpamos as macros
-// antes de incluir <inputtino/input.hpp>. O inputtino upstream usa
-// exatamente esses enumeradores. :contentReference[oaicite:0]{index=0}
 using namespace std::literals;
 
 namespace platf {
