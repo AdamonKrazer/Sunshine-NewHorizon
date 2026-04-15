@@ -7,7 +7,20 @@
 #include <bitset>
 #include <list>
 #include <thread>
+#include <array>
+#include <cerrno>
+#include <cstdint>
+#include <cstring>
 #include <cstdlib>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 // lib includes
 #include <boost/pointer_cast.hpp>
@@ -17,24 +30,6 @@ extern "C" {
 #include <libavutil/mastering_display_metadata.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
-#include <libavcodec/jni.h>
-}
-
-// local includes
-#include "cbs.h"
-#include "config.h"
-#include "display_device.h"
-#include "globals.h"
-#include "input.h"
-#include "logging.h"
-#include "nvenc/nvenc_base.h"
-#include "platform/common.h"
-#include "sync.h"
-#include "video.h"
-
-#ifdef _WIN32
-extern "C" {
-  #include <libavutil/hwcontext_d3d11va.h>
 }
 #endif
 
@@ -72,58 +67,7 @@ namespace video {
       return false;
     }
   }  // namespace
-#ifdef __linux__
-static std::string nh_getenv_str(const char *name) {
-    const char *value = std::getenv(name);
-    return (value && *value) ? std::string(value) : std::string();
-}
 
-static bool nh_is_mediacodec_name(std::string_view name) {
-    return name == "h264_mediacodec"sv || name == "hevc_mediacodec"sv || name == "av1_mediacodec"sv;
-}
-
-static void nh_apply_mediacodec_runtime_options(AVDictionary **options, std::string_view ffmpeg_codec_name) {
-    if (!options || !nh_is_mediacodec_name(ffmpeg_codec_name)) {
-        return;
-    }
-
-    // Força o mesmo caminho que funcionou no teu teste do host.
-    av_dict_set(options, "ndk_codec", "0", 0);
-    av_dict_set(options, "bitrate_mode", "vbr", 0);
-
-    std::string preferred_codec_name;
-    if (ffmpeg_codec_name == "h264_mediacodec"sv) {
-        preferred_codec_name = nh_getenv_str("NH_MEDIACODEC_H264_EXACT_NAME");
-        if (preferred_codec_name.empty()) {
-            preferred_codec_name = nh_getenv_str("NH_MEDIACODEC_H264_CANONICAL_NAME");
-        }
-    } else if (ffmpeg_codec_name == "hevc_mediacodec"sv) {
-        preferred_codec_name = nh_getenv_str("NH_MEDIACODEC_HEVC_EXACT_NAME");
-        if (preferred_codec_name.empty()) {
-            preferred_codec_name = nh_getenv_str("NH_MEDIACODEC_HEVC_CANONICAL_NAME");
-        }
-    }
-
-    if (!preferred_codec_name.empty()) {
-        av_dict_set(options, "codec_name", preferred_codec_name.c_str(), 0);
-    }
-}
-
-static void nh_log_mediacodec_runtime_options(std::string_view ffmpeg_codec_name, AVDictionary *options, void *log_ctx) {
-    if (!nh_is_mediacodec_name(ffmpeg_codec_name)) {
-        return;
-    }
-
-    BOOST_LOG(info) << "MediaCodec/JNI status for ["sv << ffmpeg_codec_name
-                    << "]: JavaVM="sv
-                    << (av_jni_get_java_vm(log_ctx) ? "set" : "null");
-
-    AVDictionaryEntry *entry = nullptr;
-    while ((entry = av_dict_get(options, "", entry, AV_DICT_IGNORE_SUFFIX))) {
-        BOOST_LOG(info) << "MediaCodec option ["sv << entry->key << "] = ["sv << entry->value << ']';
-    }
-}
-#endif
   void free_ctx(AVCodecContext *ctx) {
     avcodec_free_context(&ctx);
   }
@@ -525,6 +469,379 @@ static void nh_log_mediacodec_runtime_options(std::string_view ffmpeg_codec_name
   // Keep a reference counter to ensure the capture thread only runs when other threads have a reference to the capture thread
   auto capture_thread_async = safe::make_shared<capture_thread_async_ctx_t>(start_capture_async, end_capture_async);
   auto capture_thread_sync = safe::make_shared<capture_thread_sync_ctx_t>(start_capture_sync, end_capture_sync);
+  
+  #ifdef __linux__
+  namespace {
+    constexpr uint32_t NHMC_MAGIC = 0x4E484D43;
+    constexpr uint32_t NHMC_VERSION = 1;
+
+    constexpr uint32_t NHMC_CMD_INIT = 1;
+    constexpr uint32_t NHMC_CMD_FRAME = 2;
+    constexpr uint32_t NHMC_CMD_CLOSE = 3;
+
+    constexpr uint32_t NHMC_RSP_PACKET = 100;
+    constexpr uint32_t NHMC_RSP_FRAME_DONE = 101;
+    constexpr uint32_t NHMC_RSP_OK = 200;
+
+    constexpr uint32_t NHMC_FLAG_FORCE_IDR = 1;
+
+    static std::string nh_getenv_str(const char *name) {
+      const char *value = std::getenv(name);
+      return (value && *value) ? std::string(value) : std::string();
+    }
+
+    static uint64_t nh_htonll(uint64_t value) {
+      static const int num = 42;
+      if (*(const char *) &num == 42) {
+        return ((uint64_t) htonl((uint32_t) (value & 0xffffffffULL)) << 32) |
+               htonl((uint32_t) (value >> 32));
+      }
+      return value;
+    }
+
+    static uint64_t nh_ntohll(uint64_t value) {
+      return nh_htonll(value);
+    }
+
+    static bool nh_write_all(int fd, const void *buf, size_t len) {
+      const uint8_t *ptr = (const uint8_t *) buf;
+      while (len > 0) {
+        ssize_t written = ::write(fd, ptr, len);
+        if (written <= 0) {
+          if (errno == EINTR) {
+            continue;
+          }
+          return false;
+        }
+        ptr += written;
+        len -= (size_t) written;
+      }
+      return true;
+    }
+
+    static bool nh_read_all(int fd, void *buf, size_t len) {
+      uint8_t *ptr = (uint8_t *) buf;
+      while (len > 0) {
+        ssize_t rd = ::read(fd, ptr, len);
+        if (rd <= 0) {
+          if (errno == EINTR) {
+            continue;
+          }
+          return false;
+        }
+        ptr += rd;
+        len -= (size_t) rd;
+      }
+      return true;
+    }
+
+    static bool nh_write_u32(int fd, uint32_t value) {
+      value = htonl(value);
+      return nh_write_all(fd, &value, sizeof(value));
+    }
+
+    static bool nh_write_u64(int fd, uint64_t value) {
+      value = nh_htonll(value);
+      return nh_write_all(fd, &value, sizeof(value));
+    }
+
+    static bool nh_read_u32(int fd, uint32_t &value) {
+      uint32_t tmp {};
+      if (!nh_read_all(fd, &tmp, sizeof(tmp))) {
+        return false;
+      }
+      value = ntohl(tmp);
+      return true;
+    }
+
+    static bool nh_read_u64(int fd, uint64_t &value) {
+      uint64_t tmp {};
+      if (!nh_read_all(fd, &tmp, sizeof(tmp))) {
+        return false;
+      }
+      value = nh_ntohll(tmp);
+      return true;
+    }
+
+    static int nh_connect_bridge_socket() {
+      int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+      if (fd < 0) {
+        return -1;
+      }
+
+      auto port_str = nh_getenv_str("NH_MEDIACODEC_BRIDGE_PORT");
+      int port = port_str.empty() ? 55070 : std::stoi(port_str);
+
+      sockaddr_in addr {};
+      addr.sin_family = AF_INET;
+      addr.sin_port = htons((uint16_t) port);
+      addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+      if (::connect(fd, (sockaddr *) &addr, sizeof(addr)) != 0) {
+        ::close(fd);
+        return -1;
+      }
+
+      return fd;
+    }
+  }  // namespace
+
+  class android_bridge_encode_session_t: public encode_session_t {
+  public:
+    android_bridge_encode_session_t(const config_t &config, int width, int height, std::string codec_name):
+        width(width),
+        height(height),
+        bitrate(((config::video.max_bitrate > 0) ? std::min(config.bitrate, config::video.max_bitrate) : config.bitrate) * 1000),
+        fps(config.framerate),
+        codec_name(std::move(codec_name)) {
+
+      fd = nh_connect_bridge_socket();
+      if (fd < 0) {
+        BOOST_LOG(error) << "Could not connect to Android MediaCodec bridge";
+        return;
+      }
+
+      yuv_frame.reset(av_frame_alloc());
+      yuv_frame->format = AV_PIX_FMT_YUV420P;
+      yuv_frame->width = width;
+      yuv_frame->height = height;
+
+      if (av_frame_get_buffer(yuv_frame.get(), 32) < 0) {
+        BOOST_LOG(error) << "Could not allocate YUV420P frame for Android bridge";
+        ::close(fd);
+        fd = -1;
+        return;
+      }
+
+      sws.reset(sws_getCachedContext(
+        nullptr,
+        width,
+        height,
+        AV_PIX_FMT_BGR0,
+        width,
+        height,
+        AV_PIX_FMT_YUV420P,
+        SWS_FAST_BILINEAR,
+        nullptr,
+        nullptr,
+        nullptr
+      ));
+
+      if (!sws) {
+        BOOST_LOG(error) << "Could not create sws context for Android bridge";
+        ::close(fd);
+        fd = -1;
+        return;
+      }
+
+      if (!send_init()) {
+        BOOST_LOG(error) << "Could not initialize Android MediaCodec bridge session";
+        ::close(fd);
+        fd = -1;
+        return;
+      }
+    }
+
+    ~android_bridge_encode_session_t() override {
+      if (fd >= 0) {
+        nh_write_u32(fd, NHMC_MAGIC);
+        nh_write_u32(fd, NHMC_VERSION);
+        nh_write_u32(fd, NHMC_CMD_CLOSE);
+        ::close(fd);
+        fd = -1;
+      }
+    }
+
+    bool good() const {
+      return fd >= 0;
+    }
+
+    int convert(platf::img_t &img) override {
+      if (fd < 0) {
+        return -1;
+      }
+
+      av_frame_make_writable(yuv_frame.get());
+
+      const uint8_t *src_data[4] = {img.data, nullptr, nullptr, nullptr};
+      int src_linesize[4] = {img.row_pitch, 0, 0, 0};
+
+      if (sws_scale(
+            sws.get(),
+            src_data,
+            src_linesize,
+            0,
+            height,
+            yuv_frame->data,
+            yuv_frame->linesize) <= 0) {
+        BOOST_LOG(error) << "sws_scale failed for Android MediaCodec bridge";
+        return -1;
+      }
+
+      pending_frame.clear();
+      pending_frame.reserve((size_t) width * height * 3 / 2);
+
+      for (int y = 0; y < height; y++) {
+        const uint8_t *row = yuv_frame->data[0] + yuv_frame->linesize[0] * y;
+        pending_frame.insert(pending_frame.end(), row, row + width);
+      }
+      for (int y = 0; y < height / 2; y++) {
+        const uint8_t *row = yuv_frame->data[1] + yuv_frame->linesize[1] * y;
+        pending_frame.insert(pending_frame.end(), row, row + (width / 2));
+      }
+      for (int y = 0; y < height / 2; y++) {
+        const uint8_t *row = yuv_frame->data[2] + yuv_frame->linesize[2] * y;
+        pending_frame.insert(pending_frame.end(), row, row + (width / 2));
+      }
+
+      return 0;
+    }
+
+    void request_idr_frame() override {
+      force_idr = true;
+    }
+
+    void request_normal_frame() override {
+      force_idr = false;
+    }
+
+    void invalidate_ref_frames(int64_t, int64_t) override {
+      force_idr = true;
+    }
+
+    int encode_frame(
+      int64_t frame_nr,
+      safe::mail_raw_t::queue_t<packet_t> &packets,
+      void *channel_data,
+      std::optional<std::chrono::steady_clock::time_point> frame_timestamp
+    ) {
+      if (fd < 0) {
+        return -1;
+      }
+
+      if (!nh_write_u32(fd, NHMC_MAGIC) ||
+          !nh_write_u32(fd, NHMC_VERSION) ||
+          !nh_write_u32(fd, NHMC_CMD_FRAME) ||
+          !nh_write_u64(fd, (uint64_t) frame_nr) ||
+          !nh_write_u32(fd, force_idr ? NHMC_FLAG_FORCE_IDR : 0) ||
+          !nh_write_u32(fd, (uint32_t) pending_frame.size()) ||
+          !nh_write_all(fd, pending_frame.data(), pending_frame.size())) {
+        BOOST_LOG(error) << "Failed to send frame to Android MediaCodec bridge";
+        return -1;
+      }
+
+      force_idr = false;
+
+      bool first_packet = true;
+
+      while (true) {
+        uint32_t rsp {};
+        if (!nh_read_u32(fd, rsp)) {
+          BOOST_LOG(error) << "Failed to read response from Android MediaCodec bridge";
+          return -1;
+        }
+
+        if (rsp == NHMC_RSP_FRAME_DONE) {
+          return 0;
+        }
+
+        if (rsp != NHMC_RSP_PACKET) {
+          BOOST_LOG(error) << "Invalid response from Android MediaCodec bridge: " << rsp;
+          return -1;
+        }
+
+        uint64_t pts {};
+        uint32_t flags {};
+        uint32_t size {};
+
+        if (!nh_read_u64(fd, pts) ||
+            !nh_read_u32(fd, flags) ||
+            !nh_read_u32(fd, size)) {
+          BOOST_LOG(error) << "Failed to read packet header from Android MediaCodec bridge";
+          return -1;
+        }
+
+        std::vector<uint8_t> packet_bytes(size);
+        if (size > 0 && !nh_read_all(fd, packet_bytes.data(), size)) {
+          BOOST_LOG(error) << "Failed to read packet payload from Android MediaCodec bridge";
+          return -1;
+        }
+
+        bool is_idr = (flags & 1) != 0;
+
+        auto packet = std::make_unique<packet_raw_generic>(std::move(packet_bytes), frame_nr, is_idr);
+        packet->channel_data = channel_data;
+        if (first_packet) {
+          packet->frame_timestamp = frame_timestamp;
+          first_packet = false;
+        }
+        packets->raise(std::move(packet));
+      }
+    }
+
+  private:
+    bool send_init() {
+      if (!nh_write_u32(fd, NHMC_MAGIC) ||
+          !nh_write_u32(fd, NHMC_VERSION) ||
+          !nh_write_u32(fd, NHMC_CMD_INIT) ||
+          !nh_write_u32(fd, (uint32_t) width) ||
+          !nh_write_u32(fd, (uint32_t) height) ||
+          !nh_write_u32(fd, (uint32_t) bitrate) ||
+          !nh_write_u32(fd, (uint32_t) fps) ||
+          !nh_write_u32(fd, 2) ||
+          !nh_write_u32(fd, (uint32_t) codec_name.size()) ||
+          !nh_write_all(fd, codec_name.data(), codec_name.size())) {
+        return false;
+      }
+
+      uint32_t rsp {};
+      return nh_read_u32(fd, rsp) && rsp == NHMC_RSP_OK;
+    }
+
+    int fd {-1};
+    int width {};
+    int height {};
+    int bitrate {};
+    int fps {};
+    std::string codec_name;
+    bool force_idr {false};
+
+    avcodec_frame_t yuv_frame;
+    sws_t sws;
+    std::vector<uint8_t> pending_frame;
+  };
+
+  static std::unique_ptr<android_bridge_encode_session_t> make_android_bridge_encode_session(
+    const config_t &config,
+    int width,
+    int height
+  ) {
+    auto codec_name = nh_getenv_str("NH_MEDIACODEC_H264_EXACT_NAME");
+    if (codec_name.empty()) {
+      codec_name = nh_getenv_str("NH_MEDIACODEC_H264_CANONICAL_NAME");
+    }
+    if (codec_name.empty()) {
+      BOOST_LOG(error) << "NH_MEDIACODEC_H264_EXACT_NAME/NH_MEDIACODEC_H264_CANONICAL_NAME ausentes";
+      return nullptr;
+    }
+
+    auto session = std::make_unique<android_bridge_encode_session_t>(config, width, height, codec_name);
+    if (!session->good()) {
+      return nullptr;
+    }
+    return session;
+  }
+
+  int encode_android_bridge(
+    int64_t frame_nr,
+    android_bridge_encode_session_t &session,
+    safe::mail_raw_t::queue_t<packet_t> &packets,
+    void *channel_data,
+    std::optional<std::chrono::steady_clock::time_point> frame_timestamp
+  ) {
+    return session.encode_frame(frame_nr, packets, channel_data, frame_timestamp);
+  }
+#endif
 
 #ifdef _WIN32
   encoder_t nvenc {
@@ -1005,47 +1322,44 @@ static void nh_log_mediacodec_runtime_options(std::string_view ffmpeg_codec_name
   encoder_t mediacodec_h264 {
     "mediacodec_h264"sv,
     std::make_unique<encoder_platform_formats_avcodec>(
-        AV_HWDEVICE_TYPE_NONE,
-        AV_HWDEVICE_TYPE_NONE,
-        AV_PIX_FMT_NONE,
-        AV_PIX_FMT_YUV420P,
-        AV_PIX_FMT_NONE,
-        AV_PIX_FMT_NONE,
-        AV_PIX_FMT_NONE,
-        nullptr
+      AV_HWDEVICE_TYPE_NONE,
+      AV_HWDEVICE_TYPE_NONE,
+      AV_PIX_FMT_NONE,
+      AV_PIX_FMT_YUV420P,
+      AV_PIX_FMT_NONE,
+      AV_PIX_FMT_NONE,
+      AV_PIX_FMT_NONE,
+      nullptr
     ),
     {
-        {}, // Common options
-        {}, // SDR-specific options
-        {}, // HDR-specific options
-        {}, // YUV444 SDR-specific options
-        {}, // YUV444 HDR-specific options
-        {}, // Fallback options
-        {}, // AV1 encoder name vazio
+      {},  // Common options
+      {},  // SDR-specific options
+      {},  // HDR-specific options
+      {},  // YUV444 SDR-specific options
+      {},  // YUV444 HDR-specific options
+      {},  // Fallback options
+      {},  // AV1 encoder name vazio
     },
     {
-        {}, // Common options
-        {}, // SDR-specific options
-        {}, // HDR-specific options
-        {}, // YUV444 SDR-specific options
-        {}, // YUV444 HDR-specific options
-        {}, // Fallback options
-        {}, // HEVC encoder name vazio
+      {},  // Common options
+      {},  // SDR-specific options
+      {},  // HDR-specific options
+      {},  // YUV444 SDR-specific options
+      {},  // YUV444 HDR-specific options
+      {},  // Fallback options
+      {},  // HEVC encoder name vazio
     },
     {
-        {
-            {"ndk_codec"s, 0},
-            {"bitrate_mode"s, "vbr"s},
-        }, // Common options
-        {}, // SDR-specific options
-        {}, // HDR-specific options
-        {}, // YUV444 SDR-specific options
-        {}, // YUV444 HDR-specific options
-        {}, // Fallback options
-        "h264_mediacodec"s,
+      {},  // Common options
+      {},  // SDR-specific options
+      {},  // HDR-specific options
+      {},  // YUV444 SDR-specific options
+      {},  // YUV444 HDR-specific options
+      {},  // Fallback options
+      "h264_mediacodec"s,
     },
     H264_ONLY | ALWAYS_REPROBE
-};
+  };
 #endif
 
 #ifdef __APPLE__
@@ -1559,14 +1873,20 @@ static void nh_log_mediacodec_runtime_options(std::string_view ffmpeg_codec_name
   }
 
   int encode(int64_t frame_nr, encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
-    if (auto avcodec_session = dynamic_cast<avcodec_encode_session_t *>(&session)) {
-      return encode_avcodec(frame_nr, *avcodec_session, packets, channel_data, frame_timestamp);
-    } else if (auto nvenc_session = dynamic_cast<nvenc_encode_session_t *>(&session)) {
-      return encode_nvenc(frame_nr, *nvenc_session, packets, channel_data, frame_timestamp);
-    }
-
-    return -1;
+#ifdef __linux__
+  if (auto bridge_session = dynamic_cast<android_bridge_encode_session_t *>(&session)) {
+    return encode_android_bridge(frame_nr, *bridge_session, packets, channel_data, frame_timestamp);
   }
+#endif
+
+  if (auto avcodec_session = dynamic_cast<avcodec_encode_session_t *>(&session)) {
+    return encode_avcodec(frame_nr, *avcodec_session, packets, channel_data, frame_timestamp);
+  } else if (auto nvenc_session = dynamic_cast<nvenc_encode_session_t *>(&session)) {
+    return encode_nvenc(frame_nr, *nvenc_session, packets, channel_data, frame_timestamp);
+  }
+
+  return -1;
+}
 
   std::unique_ptr<avcodec_encode_session_t> make_avcodec_encode_session(
     platf::display_t *disp,
@@ -1755,138 +2075,115 @@ static void nh_log_mediacodec_runtime_options(std::string_view ffmpeg_codec_name
       ctx->thread_count = ctx->slices;
 
       AVDictionary *options {nullptr};
-auto handle_option = [&options, &config](const encoder_t::option_t &option) {
-  std::visit(
-    util::overloaded {
-      [&](int v) {
-        av_dict_set_int(&options, option.name.c_str(), v, 0);
-      },
-      [&](int *v) {
-        av_dict_set_int(&options, option.name.c_str(), *v, 0);
-      },
-      [&](std::optional<int> *v) {
-        if (*v) {
-          av_dict_set_int(&options, option.name.c_str(), **v, 0);
-        }
-      },
-      [&](const std::function<int()> &v) {
-        av_dict_set_int(&options, option.name.c_str(), v(), 0);
-      },
-      [&](const std::string &v) {
-        av_dict_set(&options, option.name.c_str(), v.c_str(), 0);
-      },
-      [&](std::string *v) {
-        if (!v->empty()) {
-          av_dict_set(&options, option.name.c_str(), v->c_str(), 0);
-        }
-      },
-      [&](const std::function<const std::string(const config_t &cfg)> &v) {
-        av_dict_set(&options, option.name.c_str(), v(config).c_str(), 0);
+      auto handle_option = [&options, &config](const encoder_t::option_t &option) {
+        std::visit(
+          util::overloaded {
+            [&](int v) {
+              av_dict_set_int(&options, option.name.c_str(), v, 0);
+            },
+            [&](int *v) {
+              av_dict_set_int(&options, option.name.c_str(), *v, 0);
+            },
+            [&](std::optional<int> *v) {
+              if (*v) {
+                av_dict_set_int(&options, option.name.c_str(), **v, 0);
+              }
+            },
+            [&](const std::function<int()> &v) {
+              av_dict_set_int(&options, option.name.c_str(), v(), 0);
+            },
+            [&](const std::string &v) {
+              av_dict_set(&options, option.name.c_str(), v.c_str(), 0);
+            },
+            [&](std::string *v) {
+              if (!v->empty()) {
+                av_dict_set(&options, option.name.c_str(), v->c_str(), 0);
+              }
+            },
+            [&](const std::function<const std::string(const config_t &cfg)> &v) {
+              av_dict_set(&options, option.name.c_str(), v(config).c_str(), 0);
+            }
+          },
+          option.value
+        );
+      };
+
+      // Apply common options, then format-specific overrides
+      for (auto &option : video_format.common_options) {
+        handle_option(option);
       }
-    },
-    option.value
-  );
-};
+      for (auto &option : (config.dynamicRange ? video_format.hdr_options : video_format.sdr_options)) {
+        handle_option(option);
+      }
+      if (config.chromaSamplingType == 1) {
+        for (auto &option : (config.dynamicRange ? video_format.hdr444_options : video_format.sdr444_options)) {
+          handle_option(option);
+        }
+      }
+      if (retries > 0) {
+        for (auto &option : video_format.fallback_options) {
+          handle_option(option);
+        }
+      }
 
-// Apply common options, then format-specific overrides
-for (auto &option : video_format.common_options) {
-  handle_option(option);
-}
-for (auto &option : (config.dynamicRange ? video_format.hdr_options : video_format.sdr_options)) {
-  handle_option(option);
-}
-if (config.chromaSamplingType == 1) {
-  for (auto &option : (config.dynamicRange ? video_format.hdr444_options : video_format.sdr444_options)) {
-    handle_option(option);
-  }
-}
-if (retries > 0) {
-  for (auto &option : video_format.fallback_options) {
-    handle_option(option);
-  }
-}
+      auto bitrate = ((config::video.max_bitrate > 0) ? std::min(config.bitrate, config::video.max_bitrate) : config.bitrate) * 1000;
+      BOOST_LOG(info) << "Streaming bitrate is " << bitrate;
+      ctx->rc_max_rate = bitrate;
+      ctx->bit_rate = bitrate;
 
-auto bitrate = ((config::video.max_bitrate > 0) ? std::min(config.bitrate, config::video.max_bitrate) : config.bitrate) * 1000;
-BOOST_LOG(info) << "Streaming bitrate is " << bitrate;
-ctx->rc_max_rate = bitrate;
-ctx->bit_rate = bitrate;
+      if (encoder.flags & CBR_WITH_VBR) {
+        // Ensure rc_max_bitrate != bit_rate to force VBR mode
+        ctx->bit_rate--;
+      } else {
+        ctx->rc_min_rate = bitrate;
+      }
 
-if (encoder.flags & CBR_WITH_VBR) {
-  // Ensure rc_max_bitrate != bit_rate to force VBR mode
-  ctx->bit_rate--;
-} else {
-  ctx->rc_min_rate = bitrate;
-}
+      if (encoder.flags & RELAXED_COMPLIANCE) {
+        ctx->strict_std_compliance = FF_COMPLIANCE_UNOFFICIAL;
+      }
 
-if (encoder.flags & RELAXED_COMPLIANCE) {
-  ctx->strict_std_compliance = FF_COMPLIANCE_UNOFFICIAL;
-}
-
-if (!(encoder.flags & NO_RC_BUF_LIMIT)) {
-  if (!hardware && (ctx->slices > 1 || config.videoFormat == 1)) {
-    // Use a larger rc_buffer_size for software encoding when slices are enabled,
-    // because libx264 can severely degrade quality if the buffer is too small.
-    // libx265 encounters this issue more frequently, so always scale the
-    // buffer by 1.5x for software HEVC encoding.
-    ctx->rc_buffer_size = bitrate / ((config.framerate * 10) / 15);
-  } else {
-    ctx->rc_buffer_size = bitrate / config.framerate;
+      if (!(encoder.flags & NO_RC_BUF_LIMIT)) {
+        if (!hardware && (ctx->slices > 1 || config.videoFormat == 1)) {
+          // Use a larger rc_buffer_size for software encoding when slices are enabled,
+          // because libx264 can severely degrade quality if the buffer is too small.
+          // libx265 encounters this issue more frequently, so always scale the
+          // buffer by 1.5x for software HEVC encoding.
+          ctx->rc_buffer_size = bitrate / ((config.framerate * 10) / 15);
+        } else {
+          ctx->rc_buffer_size = bitrate / config.framerate;
 
 #ifndef __APPLE__
-    if (encoder.name == "nvenc" && config::video.nv_legacy.vbv_percentage_increase > 0) {
-      ctx->rc_buffer_size += ctx->rc_buffer_size * config::video.nv_legacy.vbv_percentage_increase / 100;
-    }
+          if (encoder.name == "nvenc" && config::video.nv_legacy.vbv_percentage_increase > 0) {
+            ctx->rc_buffer_size += ctx->rc_buffer_size * config::video.nv_legacy.vbv_percentage_increase / 100;
+          }
 #endif
-  }
-}
+        }
+      }
 
-// Força as opções do MediaCodec que já passaram no host
-#ifdef __linux__
-nh_apply_mediacodec_runtime_options(&options, video_format.name);
-#endif
+      // Allow the encoding device a final opportunity to set/unset or override any options
+      encode_device->init_codec_options(ctx.get(), &options);
 
-// Allow the encoding device a final opportunity to set/unset or override any options
-encode_device->init_codec_options(ctx.get(), &options);
+      if (auto status = avcodec_open2(ctx.get(), codec, &options)) {
+        char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
 
-#ifdef __linux__
-nh_log_mediacodec_runtime_options(video_format.name, options, ctx.get());
-#endif
+        if (!video_format.fallback_options.empty() && retries == 0) {
+          BOOST_LOG(info)
+            << "Retrying with fallback configuration options for ["sv << video_format.name << "] after error: "sv
+            << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, status);
 
-if (auto status = avcodec_open2(ctx.get(), codec, &options)) {
-  char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
+          continue;
+        } else {
+          BOOST_LOG(error)
+            << "Could not open codec ["sv
+            << video_format.name << "]: "sv
+            << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, status);
 
-#ifdef __linux__
-  if (nh_is_mediacodec_name(video_format.name)) {
-    BOOST_LOG(error)
-      << "MediaCodec open failure ["sv
-      << video_format.name
-      << "], JavaVM="
-      << (av_jni_get_java_vm(ctx.get()) ? "set" : "null");
-  }
-#endif
+          return nullptr;
+        }
+      }
 
-  av_dict_free(&options);
-
-  if (!video_format.fallback_options.empty() && retries == 0) {
-    BOOST_LOG(info)
-      << "Retrying with fallback configuration options for ["sv << video_format.name << "] after error: "sv
-      << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, status);
-
-    continue;
-  } else {
-    BOOST_LOG(error)
-      << "Could not open codec ["sv
-      << video_format.name << "]: "sv
-      << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, status);
-
-    return nullptr;
-  }
-}
-
-av_dict_free(&options);
-
-// Successfully opened the codec
-break;
+      // Successfully opened the codec
+      break;
     }
 
     avcodec_frame_t frame {av_frame_alloc()};
@@ -1973,16 +2270,22 @@ break;
   }
 
   std::unique_ptr<encode_session_t> make_encode_session(platf::display_t *disp, const encoder_t &encoder, const config_t &config, int width, int height, std::unique_ptr<platf::encode_device_t> encode_device) {
-    if (dynamic_cast<platf::avcodec_encode_device_t *>(encode_device.get())) {
-      auto avcodec_encode_device = boost::dynamic_pointer_cast<platf::avcodec_encode_device_t>(std::move(encode_device));
-      return make_avcodec_encode_session(disp, encoder, config, width, height, std::move(avcodec_encode_device));
-    } else if (dynamic_cast<platf::nvenc_encode_device_t *>(encode_device.get())) {
-      auto nvenc_encode_device = boost::dynamic_pointer_cast<platf::nvenc_encode_device_t>(std::move(encode_device));
-      return make_nvenc_encode_session(config, std::move(nvenc_encode_device));
-    }
-
-    return nullptr;
+#ifdef __linux__
+  if (encoder.name == "mediacodec_h264") {
+    return make_android_bridge_encode_session(config, width, height);
   }
+#endif
+
+  if (dynamic_cast<platf::avcodec_encode_device_t *>(encode_device.get())) {
+    auto avcodec_encode_device = boost::dynamic_pointer_cast<platf::avcodec_encode_device_t>(std::move(encode_device));
+    return make_avcodec_encode_session(disp, encoder, config, width, height, std::move(avcodec_encode_device));
+  } else if (dynamic_cast<platf::nvenc_encode_device_t *>(encode_device.get())) {
+    auto nvenc_encode_device = boost::dynamic_pointer_cast<platf::nvenc_encode_device_t>(std::move(encode_device));
+    return make_nvenc_encode_session(config, std::move(nvenc_encode_device));
+  }
+
+  return nullptr;
+}
 
   void encode_run(
     int &frame_nr,  // Store progress of the frame number
