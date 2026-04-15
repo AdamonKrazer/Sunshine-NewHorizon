@@ -16,21 +16,39 @@
 #include <string>
 #include <string_view>
 #include <vector>
-
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include <algorithm>
 
 // lib includes
 #include <boost/pointer_cast.hpp>
 
 extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavutil/frame.h>
+#include <libavutil/hwcontext.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/mastering_display_metadata.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
+#include <libswscale/swscale.h>
 }
+
+// local includes
+#include "cbs.h"
+#include "config.h"
+#include "display_device.h"
+#include "globals.h"
+#include "input.h"
+#include "logging.h"
+#include "nvenc/nvenc_base.h"
+#include "platform/common.h"
+#include "sync.h"
+#include "video.h"
+
+#ifdef __linux__
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #endif
 
 using namespace std::literals;
