@@ -7,6 +7,7 @@
 #include <bitset>
 #include <list>
 #include <thread>
+#include <cstdlib>
 
 // lib includes
 #include <boost/pointer_cast.hpp>
@@ -16,6 +17,7 @@ extern "C" {
 #include <libavutil/mastering_display_metadata.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
+#include <libavcodec/jni.h>
 }
 
 // local includes
@@ -70,7 +72,58 @@ namespace video {
       return false;
     }
   }  // namespace
+#ifdef __linux__
+static std::string nh_getenv_str(const char *name) {
+    const char *value = std::getenv(name);
+    return (value && *value) ? std::string(value) : std::string();
+}
 
+static bool nh_is_mediacodec_name(std::string_view name) {
+    return name == "h264_mediacodec"sv || name == "hevc_mediacodec"sv || name == "av1_mediacodec"sv;
+}
+
+static void nh_apply_mediacodec_runtime_options(AVDictionary **options, std::string_view ffmpeg_codec_name) {
+    if (!options || !nh_is_mediacodec_name(ffmpeg_codec_name)) {
+        return;
+    }
+
+    // Força o mesmo caminho que funcionou no teu teste do host.
+    av_dict_set(options, "ndk_codec", "0", 0);
+    av_dict_set(options, "bitrate_mode", "vbr", 0);
+
+    std::string preferred_codec_name;
+    if (ffmpeg_codec_name == "h264_mediacodec"sv) {
+        preferred_codec_name = nh_getenv_str("NH_MEDIACODEC_H264_EXACT_NAME");
+        if (preferred_codec_name.empty()) {
+            preferred_codec_name = nh_getenv_str("NH_MEDIACODEC_H264_CANONICAL_NAME");
+        }
+    } else if (ffmpeg_codec_name == "hevc_mediacodec"sv) {
+        preferred_codec_name = nh_getenv_str("NH_MEDIACODEC_HEVC_EXACT_NAME");
+        if (preferred_codec_name.empty()) {
+            preferred_codec_name = nh_getenv_str("NH_MEDIACODEC_HEVC_CANONICAL_NAME");
+        }
+    }
+
+    if (!preferred_codec_name.empty()) {
+        av_dict_set(options, "codec_name", preferred_codec_name.c_str(), 0);
+    }
+}
+
+static void nh_log_mediacodec_runtime_options(std::string_view ffmpeg_codec_name, AVDictionary *options, void *log_ctx) {
+    if (!nh_is_mediacodec_name(ffmpeg_codec_name)) {
+        return;
+    }
+
+    BOOST_LOG(info) << "MediaCodec/JNI status for ["sv << ffmpeg_codec_name
+                    << "]: JavaVM="sv
+                    << (av_jni_get_java_vm(log_ctx) ? "set" : "null");
+
+    AVDictionaryEntry *entry = nullptr;
+    while ((entry = av_dict_get(options, "", entry, AV_DICT_IGNORE_SUFFIX))) {
+        BOOST_LOG(info) << "MediaCodec option ["sv << entry->key << "] = ["sv << entry->value << ']';
+    }
+}
+#endif
   void free_ctx(AVCodecContext *ctx) {
     avcodec_free_context(&ctx);
   }
@@ -952,44 +1005,47 @@ namespace video {
   encoder_t mediacodec_h264 {
     "mediacodec_h264"sv,
     std::make_unique<encoder_platform_formats_avcodec>(
-      AV_HWDEVICE_TYPE_NONE,
-      AV_HWDEVICE_TYPE_NONE,
-      AV_PIX_FMT_NONE,
-      AV_PIX_FMT_YUV420P,
-      AV_PIX_FMT_NONE,
-      AV_PIX_FMT_NONE,
-      AV_PIX_FMT_NONE,
-      nullptr
+        AV_HWDEVICE_TYPE_NONE,
+        AV_HWDEVICE_TYPE_NONE,
+        AV_PIX_FMT_NONE,
+        AV_PIX_FMT_YUV420P,
+        AV_PIX_FMT_NONE,
+        AV_PIX_FMT_NONE,
+        AV_PIX_FMT_NONE,
+        nullptr
     ),
     {
-      {},  // Common options
-      {},  // SDR-specific options
-      {},  // HDR-specific options
-      {},  // YUV444 SDR-specific options
-      {},  // YUV444 HDR-specific options
-      {},  // Fallback options
-      {},  // AV1 encoder name vazio
+        {}, // Common options
+        {}, // SDR-specific options
+        {}, // HDR-specific options
+        {}, // YUV444 SDR-specific options
+        {}, // YUV444 HDR-specific options
+        {}, // Fallback options
+        {}, // AV1 encoder name vazio
     },
     {
-      {},  // Common options
-      {},  // SDR-specific options
-      {},  // HDR-specific options
-      {},  // YUV444 SDR-specific options
-      {},  // YUV444 HDR-specific options
-      {},  // Fallback options
-      {},  // HEVC encoder name vazio
+        {}, // Common options
+        {}, // SDR-specific options
+        {}, // HDR-specific options
+        {}, // YUV444 SDR-specific options
+        {}, // YUV444 HDR-specific options
+        {}, // Fallback options
+        {}, // HEVC encoder name vazio
     },
     {
-      {},  // Common options
-      {},  // SDR-specific options
-      {},  // HDR-specific options
-      {},  // YUV444 SDR-specific options
-      {},  // YUV444 HDR-specific options
-      {},  // Fallback options
-      "h264_mediacodec"s,
+        {
+            {"ndk_codec"s, 0},
+            {"bitrate_mode"s, "vbr"s},
+        }, // Common options
+        {}, // SDR-specific options
+        {}, // HDR-specific options
+        {}, // YUV444 SDR-specific options
+        {}, // YUV444 HDR-specific options
+        {}, // Fallback options
+        "h264_mediacodec"s,
     },
     H264_ONLY | ALWAYS_REPROBE
-  };
+};
 #endif
 
 #ifdef __APPLE__
@@ -1699,115 +1755,138 @@ namespace video {
       ctx->thread_count = ctx->slices;
 
       AVDictionary *options {nullptr};
-      auto handle_option = [&options, &config](const encoder_t::option_t &option) {
-        std::visit(
-          util::overloaded {
-            [&](int v) {
-              av_dict_set_int(&options, option.name.c_str(), v, 0);
-            },
-            [&](int *v) {
-              av_dict_set_int(&options, option.name.c_str(), *v, 0);
-            },
-            [&](std::optional<int> *v) {
-              if (*v) {
-                av_dict_set_int(&options, option.name.c_str(), **v, 0);
-              }
-            },
-            [&](const std::function<int()> &v) {
-              av_dict_set_int(&options, option.name.c_str(), v(), 0);
-            },
-            [&](const std::string &v) {
-              av_dict_set(&options, option.name.c_str(), v.c_str(), 0);
-            },
-            [&](std::string *v) {
-              if (!v->empty()) {
-                av_dict_set(&options, option.name.c_str(), v->c_str(), 0);
-              }
-            },
-            [&](const std::function<const std::string(const config_t &cfg)> &v) {
-              av_dict_set(&options, option.name.c_str(), v(config).c_str(), 0);
-            }
-          },
-          option.value
-        );
-      };
-
-      // Apply common options, then format-specific overrides
-      for (auto &option : video_format.common_options) {
-        handle_option(option);
-      }
-      for (auto &option : (config.dynamicRange ? video_format.hdr_options : video_format.sdr_options)) {
-        handle_option(option);
-      }
-      if (config.chromaSamplingType == 1) {
-        for (auto &option : (config.dynamicRange ? video_format.hdr444_options : video_format.sdr444_options)) {
-          handle_option(option);
+auto handle_option = [&options, &config](const encoder_t::option_t &option) {
+  std::visit(
+    util::overloaded {
+      [&](int v) {
+        av_dict_set_int(&options, option.name.c_str(), v, 0);
+      },
+      [&](int *v) {
+        av_dict_set_int(&options, option.name.c_str(), *v, 0);
+      },
+      [&](std::optional<int> *v) {
+        if (*v) {
+          av_dict_set_int(&options, option.name.c_str(), **v, 0);
         }
-      }
-      if (retries > 0) {
-        for (auto &option : video_format.fallback_options) {
-          handle_option(option);
+      },
+      [&](const std::function<int()> &v) {
+        av_dict_set_int(&options, option.name.c_str(), v(), 0);
+      },
+      [&](const std::string &v) {
+        av_dict_set(&options, option.name.c_str(), v.c_str(), 0);
+      },
+      [&](std::string *v) {
+        if (!v->empty()) {
+          av_dict_set(&options, option.name.c_str(), v->c_str(), 0);
         }
+      },
+      [&](const std::function<const std::string(const config_t &cfg)> &v) {
+        av_dict_set(&options, option.name.c_str(), v(config).c_str(), 0);
       }
+    },
+    option.value
+  );
+};
 
-      auto bitrate = ((config::video.max_bitrate > 0) ? std::min(config.bitrate, config::video.max_bitrate) : config.bitrate) * 1000;
-      BOOST_LOG(info) << "Streaming bitrate is " << bitrate;
-      ctx->rc_max_rate = bitrate;
-      ctx->bit_rate = bitrate;
+// Apply common options, then format-specific overrides
+for (auto &option : video_format.common_options) {
+  handle_option(option);
+}
+for (auto &option : (config.dynamicRange ? video_format.hdr_options : video_format.sdr_options)) {
+  handle_option(option);
+}
+if (config.chromaSamplingType == 1) {
+  for (auto &option : (config.dynamicRange ? video_format.hdr444_options : video_format.sdr444_options)) {
+    handle_option(option);
+  }
+}
+if (retries > 0) {
+  for (auto &option : video_format.fallback_options) {
+    handle_option(option);
+  }
+}
 
-      if (encoder.flags & CBR_WITH_VBR) {
-        // Ensure rc_max_bitrate != bit_rate to force VBR mode
-        ctx->bit_rate--;
-      } else {
-        ctx->rc_min_rate = bitrate;
-      }
+auto bitrate = ((config::video.max_bitrate > 0) ? std::min(config.bitrate, config::video.max_bitrate) : config.bitrate) * 1000;
+BOOST_LOG(info) << "Streaming bitrate is " << bitrate;
+ctx->rc_max_rate = bitrate;
+ctx->bit_rate = bitrate;
 
-      if (encoder.flags & RELAXED_COMPLIANCE) {
-        ctx->strict_std_compliance = FF_COMPLIANCE_UNOFFICIAL;
-      }
+if (encoder.flags & CBR_WITH_VBR) {
+  // Ensure rc_max_bitrate != bit_rate to force VBR mode
+  ctx->bit_rate--;
+} else {
+  ctx->rc_min_rate = bitrate;
+}
 
-      if (!(encoder.flags & NO_RC_BUF_LIMIT)) {
-        if (!hardware && (ctx->slices > 1 || config.videoFormat == 1)) {
-          // Use a larger rc_buffer_size for software encoding when slices are enabled,
-          // because libx264 can severely degrade quality if the buffer is too small.
-          // libx265 encounters this issue more frequently, so always scale the
-          // buffer by 1.5x for software HEVC encoding.
-          ctx->rc_buffer_size = bitrate / ((config.framerate * 10) / 15);
-        } else {
-          ctx->rc_buffer_size = bitrate / config.framerate;
+if (encoder.flags & RELAXED_COMPLIANCE) {
+  ctx->strict_std_compliance = FF_COMPLIANCE_UNOFFICIAL;
+}
+
+if (!(encoder.flags & NO_RC_BUF_LIMIT)) {
+  if (!hardware && (ctx->slices > 1 || config.videoFormat == 1)) {
+    // Use a larger rc_buffer_size for software encoding when slices are enabled,
+    // because libx264 can severely degrade quality if the buffer is too small.
+    // libx265 encounters this issue more frequently, so always scale the
+    // buffer by 1.5x for software HEVC encoding.
+    ctx->rc_buffer_size = bitrate / ((config.framerate * 10) / 15);
+  } else {
+    ctx->rc_buffer_size = bitrate / config.framerate;
 
 #ifndef __APPLE__
-          if (encoder.name == "nvenc" && config::video.nv_legacy.vbv_percentage_increase > 0) {
-            ctx->rc_buffer_size += ctx->rc_buffer_size * config::video.nv_legacy.vbv_percentage_increase / 100;
-          }
+    if (encoder.name == "nvenc" && config::video.nv_legacy.vbv_percentage_increase > 0) {
+      ctx->rc_buffer_size += ctx->rc_buffer_size * config::video.nv_legacy.vbv_percentage_increase / 100;
+    }
 #endif
-        }
-      }
+  }
+}
 
-      // Allow the encoding device a final opportunity to set/unset or override any options
-      encode_device->init_codec_options(ctx.get(), &options);
+// Força as opções do MediaCodec que já passaram no host
+#ifdef __linux__
+nh_apply_mediacodec_runtime_options(&options, video_format.name);
+#endif
 
-      if (auto status = avcodec_open2(ctx.get(), codec, &options)) {
-        char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
+// Allow the encoding device a final opportunity to set/unset or override any options
+encode_device->init_codec_options(ctx.get(), &options);
 
-        if (!video_format.fallback_options.empty() && retries == 0) {
-          BOOST_LOG(info)
-            << "Retrying with fallback configuration options for ["sv << video_format.name << "] after error: "sv
-            << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, status);
+#ifdef __linux__
+nh_log_mediacodec_runtime_options(video_format.name, options, ctx.get());
+#endif
 
-          continue;
-        } else {
-          BOOST_LOG(error)
-            << "Could not open codec ["sv
-            << video_format.name << "]: "sv
-            << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, status);
+if (auto status = avcodec_open2(ctx.get(), codec, &options)) {
+  char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
 
-          return nullptr;
-        }
-      }
+#ifdef __linux__
+  if (nh_is_mediacodec_name(video_format.name)) {
+    BOOST_LOG(error)
+      << "MediaCodec open failure ["sv
+      << video_format.name
+      << "], JavaVM="
+      << (av_jni_get_java_vm(ctx.get()) ? "set" : "null");
+  }
+#endif
 
-      // Successfully opened the codec
-      break;
+  av_dict_free(&options);
+
+  if (!video_format.fallback_options.empty() && retries == 0) {
+    BOOST_LOG(info)
+      << "Retrying with fallback configuration options for ["sv << video_format.name << "] after error: "sv
+      << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, status);
+
+    continue;
+  } else {
+    BOOST_LOG(error)
+      << "Could not open codec ["sv
+      << video_format.name << "]: "sv
+      << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, status);
+
+    return nullptr;
+  }
+}
+
+av_dict_free(&options);
+
+// Successfully opened the codec
+break;
     }
 
     avcodec_frame_t frame {av_frame_alloc()};
