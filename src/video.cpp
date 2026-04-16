@@ -950,7 +950,6 @@ namespace video {
     },
     LIMITED_GOP_SIZE | PARALLEL_ENCODING | NO_RC_BUF_LIMIT
   };
-  #ifdef __linux__
     encoder_t mediacodec_h264 {
     "mediacodec_h264"sv,
     std::make_unique<encoder_platform_formats_avcodec>(
