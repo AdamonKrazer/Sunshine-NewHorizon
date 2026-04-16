@@ -750,7 +750,10 @@ namespace video {
 
       force_idr = false;
 
-      bool first_packet = true;
+      bool first_packet_this_call = true;
+
+      constexpr uint32_t NHMC_PACKET_FLAG_KEY_FRAME = 1u;
+      constexpr uint32_t NHMC_PACKET_FLAG_CODEC_CONFIG = 2u;
 
       while (true) {
         uint32_t rsp {};
@@ -785,15 +788,68 @@ namespace video {
           return -1;
         }
 
-        bool is_idr = (flags & 1) != 0;
+        const bool is_codec_config = (flags & NHMC_PACKET_FLAG_CODEC_CONFIG) != 0;
+        const bool is_idr = (flags & NHMC_PACKET_FLAG_KEY_FRAME) != 0;
+
+        if (is_codec_config) {
+          if (!packet_bytes.empty()) {
+            if (pending_codec_config.empty()) {
+              pending_codec_config = std::move(packet_bytes);
+            } else {
+              pending_codec_config.insert(
+                pending_codec_config.end(),
+                packet_bytes.begin(),
+                packet_bytes.end()
+              );
+            }
+          }
+
+          BOOST_LOG(info) << "Android MediaCodec bridge: cached codec-config packet, flags="
+                          << flags << " size=" << size;
+          continue;
+        }
+
+        if (waiting_for_initial_idr && !is_idr) {
+          BOOST_LOG(warning) << "Android MediaCodec bridge: skipping non-IDR packet before initial keyframe, flags="
+                             << flags << " size=" << size;
+          continue;
+        }
+
+        if (is_idr && !pending_codec_config.empty()) {
+          std::vector<uint8_t> merged;
+          merged.reserve(pending_codec_config.size() + packet_bytes.size());
+
+          merged.insert(
+            merged.end(),
+            pending_codec_config.begin(),
+            pending_codec_config.end()
+          );
+          merged.insert(
+            merged.end(),
+            packet_bytes.begin(),
+            packet_bytes.end()
+          );
+
+          packet_bytes = std::move(merged);
+          pending_codec_config.clear();
+
+          BOOST_LOG(info) << "Android MediaCodec bridge: prepended cached codec-config to IDR packet";
+        }
 
         auto packet = std::make_unique<packet_raw_generic>(std::move(packet_bytes), frame_nr, is_idr);
         packet->channel_data = channel_data;
-        if (first_packet) {
+
+        if (first_packet_this_call) {
           packet->frame_timestamp = frame_timestamp;
-          first_packet = false;
+          first_packet_this_call = false;
         }
+
         packets->raise(std::move(packet));
+
+        if (waiting_for_initial_idr && is_idr) {
+          waiting_for_initial_idr = false;
+          BOOST_LOG(info) << "Android MediaCodec bridge: first emitted media packet is now an IDR";
+        }
       }
     }
 
@@ -827,54 +883,56 @@ namespace video {
     avcodec_frame_t yuv_frame;
     sws_t sws;
     std::vector<uint8_t> pending_frame;
+
+    std::vector<uint8_t> pending_codec_config;
+    bool waiting_for_initial_idr {true};
   };
 
   static std::unique_ptr<android_bridge_encode_session_t> make_android_bridge_encode_session(
-  const config_t &config,
-  int width,
-  int height
-) {
-  auto exact_name = nh_getenv_str("NH_MEDIACODEC_H264_EXACT_NAME");
-  auto canonical_name = nh_getenv_str("NH_MEDIACODEC_H264_CANONICAL_NAME");
-  auto fallback_name = nh_getenv_str("NH_MEDIACODEC_H264_FALLBACK_NAME");
-  auto bridge_port = nh_getenv_str("NH_MEDIACODEC_BRIDGE_PORT");
+    const config_t &config,
+    int width,
+    int height
+  ) {
+    auto exact_name = nh_getenv_str("NH_MEDIACODEC_H264_EXACT_NAME");
+    auto canonical_name = nh_getenv_str("NH_MEDIACODEC_H264_CANONICAL_NAME");
+    auto fallback_name = nh_getenv_str("NH_MEDIACODEC_H264_FALLBACK_NAME");
+    auto bridge_port = nh_getenv_str("NH_MEDIACODEC_BRIDGE_PORT");
 
-  std::string codec_name;
+    std::string codec_name;
 
-  if (!exact_name.empty()) {
-    codec_name = exact_name;
-    BOOST_LOG(info) << "Android MediaCodec bridge: using NH_MEDIACODEC_H264_EXACT_NAME=[" << codec_name << "]";
-  } else if (!canonical_name.empty()) {
-    codec_name = canonical_name;
-    BOOST_LOG(info) << "Android MediaCodec bridge: using NH_MEDIACODEC_H264_CANONICAL_NAME=[" << codec_name << "]";
-  } else if (!fallback_name.empty()) {
-    codec_name = fallback_name;
-    BOOST_LOG(warning) << "Android MediaCodec bridge: NH_MEDIACODEC_H264_* ausentes; usando NH_MEDIACODEC_H264_FALLBACK_NAME=[" << codec_name << "]";
-  } else {
-    // fallback direcionado ao seu aparelho atual
-    codec_name = "c2.exynos.h264.encoder";
-    BOOST_LOG(warning) << "Android MediaCodec bridge: NH_MEDIACODEC_H264_* ausentes; usando fallback fixo [" << codec_name << "]";
+    if (!exact_name.empty()) {
+      codec_name = exact_name;
+      BOOST_LOG(info) << "Android MediaCodec bridge: using NH_MEDIACODEC_H264_EXACT_NAME=[" << codec_name << "]";
+    } else if (!canonical_name.empty()) {
+      codec_name = canonical_name;
+      BOOST_LOG(info) << "Android MediaCodec bridge: using NH_MEDIACODEC_H264_CANONICAL_NAME=[" << codec_name << "]";
+    } else if (!fallback_name.empty()) {
+      codec_name = fallback_name;
+      BOOST_LOG(warning) << "Android MediaCodec bridge: NH_MEDIACODEC_H264_* ausentes; usando NH_MEDIACODEC_H264_FALLBACK_NAME=[" << codec_name << "]";
+    } else {
+      codec_name = "c2.exynos.h264.encoder";
+      BOOST_LOG(warning) << "Android MediaCodec bridge: NH_MEDIACODEC_H264_* ausentes; usando fallback fixo [" << codec_name << "]";
+    }
+
+    BOOST_LOG(info) << "Android MediaCodec bridge init: port=["
+                    << (bridge_port.empty() ? "55070(default)" : bridge_port)
+                    << "] codec_name=[" << codec_name
+                    << "] size=" << width << "x" << height
+                    << " fps=" << config.framerate
+                    << " bitrate="
+                    << (((config::video.max_bitrate > 0)
+                          ? std::min(config.bitrate, config::video.max_bitrate)
+                          : config.bitrate) * 1000);
+
+    auto session = std::make_unique<android_bridge_encode_session_t>(config, width, height, codec_name);
+    if (!session->good()) {
+      BOOST_LOG(error) << "Android MediaCodec bridge session creation failed for codec_name=[" << codec_name << "]";
+      return nullptr;
+    }
+
+    BOOST_LOG(info) << "Android MediaCodec bridge session OK for codec_name=[" << codec_name << "]";
+    return session;
   }
-
-  BOOST_LOG(info) << "Android MediaCodec bridge init: port=["
-                  << (bridge_port.empty() ? "55070(default)" : bridge_port)
-                  << "] codec_name=[" << codec_name
-                  << "] size=" << width << "x" << height
-                  << " fps=" << config.framerate
-                  << " bitrate="
-                  << (((config::video.max_bitrate > 0)
-                        ? std::min(config.bitrate, config::video.max_bitrate)
-                        : config.bitrate) * 1000);
-
-  auto session = std::make_unique<android_bridge_encode_session_t>(config, width, height, codec_name);
-  if (!session->good()) {
-    BOOST_LOG(error) << "Android MediaCodec bridge session creation failed for codec_name=[" << codec_name << "]";
-    return nullptr;
-  }
-
-  BOOST_LOG(info) << "Android MediaCodec bridge session OK for codec_name=[" << codec_name << "]";
-  return session;
-}
 
   int encode_android_bridge(
     int64_t frame_nr,
