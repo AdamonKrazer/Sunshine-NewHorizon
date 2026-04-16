@@ -8,6 +8,15 @@
 #include <list>
 #include <thread>
 #include <cstdlib>
+#include <cstring>
+#include <cerrno>
+
+#ifdef __linux__
+  #include <arpa/inet.h>
+  #include <netinet/in.h>
+  #include <sys/socket.h>
+  #include <unistd.h>
+#endif
 
 // lib includes
 #include <boost/pointer_cast.hpp>
@@ -70,6 +79,55 @@ namespace video {
       BOOST_LOG(error) << "No display devices are active at the moment! Cannot probe the encoders.";
       return false;
     }
+	#ifdef __linux__
+    const char *get_env_nonempty(const char *name) {
+      if (const char *v = std::getenv(name); v && *v) {
+        return v;
+      }
+      return nullptr;
+    }
+
+    int mediacodec_bridge_port() {
+      if (const char *v = get_env_nonempty("NH_MEDIACODEC_BRIDGE_PORT")) {
+        return std::atoi(v);
+      }
+      return 0;
+    }
+
+    bool mediacodec_bridge_ready() {
+      const int port = mediacodec_bridge_port();
+      if (port <= 0) {
+        BOOST_LOG(error) << "mediacodec_h264: NH_MEDIACODEC_BRIDGE_PORT ausente ou inválida";
+        return false;
+      }
+
+      int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+      if (fd < 0) {
+        BOOST_LOG(error) << "mediacodec_h264: socket() falhou: " << std::strerror(errno);
+        return false;
+      }
+
+      sockaddr_in addr {};
+      addr.sin_family = AF_INET;
+      addr.sin_port = htons(static_cast<uint16_t>(port));
+
+      if (::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr) != 1) {
+        BOOST_LOG(error) << "mediacodec_h264: inet_pton() falhou para 127.0.0.1";
+        ::close(fd);
+        return false;
+      }
+
+      if (::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+        BOOST_LOG(error) << "mediacodec_h264: bridge 127.0.0.1:" << port
+                         << " indisponível: " << std::strerror(errno);
+        ::close(fd);
+        return false;
+      }
+
+      ::close(fd);
+      return true;
+    }
+#endif
   }  // namespace
 
   void free_ctx(AVCodecContext *ctx) {
@@ -1093,8 +1151,8 @@ namespace video {
     &amdvce,
 #endif
 #ifdef __linux__
-    &vaapi,
 	&mediacodec_h264,
+    &vaapi,
 #endif
 #ifdef __APPLE__
     &videotoolbox,
@@ -1549,10 +1607,25 @@ namespace video {
       return nullptr;
     }
 
-    bool hardware = platform_formats->avcodec_base_dev_type != AV_HWDEVICE_TYPE_NONE;
+        bool hardware = platform_formats->avcodec_base_dev_type != AV_HWDEVICE_TYPE_NONE;
 
-        auto &video_format = encoder.codec_from_config(config);
-    const bool skip_display_codec_gate = (encoder.name == "mediacodec_h264");
+    auto &video_format = encoder.codec_from_config(config);
+    const bool is_mediacodec_h264 = (encoder.name == "mediacodec_h264");
+    const bool skip_display_codec_gate = is_mediacodec_h264;
+
+#ifdef __linux__
+    if (is_mediacodec_h264) {
+      const char *bridge_port = std::getenv("NH_MEDIACODEC_BRIDGE_PORT");
+
+      BOOST_LOG(info) << "mediacodec_h264: NH_MEDIACODEC_BRIDGE_PORT="
+                      << (bridge_port ? bridge_port : "<unset>");
+
+      if (!mediacodec_bridge_ready()) {
+        BOOST_LOG(error) << "mediacodec_h264: bridge externa do app não está acessível; abortando init deste encoder";
+        return nullptr;
+      }
+    }
+#endif
 
     if (!video_format[encoder_t::PASSED] || (!skip_display_codec_gate && !disp->is_codec_supported(video_format.name, config))) {
       BOOST_LOG(error) << encoder.name << ": "sv << video_format.name << " mode not supported"sv;
@@ -1571,17 +1644,19 @@ namespace video {
 
     auto codec = avcodec_find_encoder_by_name(video_format.name.c_str());
 
-    if (encoder.name == "mediacodec_h264") {
+        if (is_mediacodec_h264) {
       const char *exact = std::getenv("NH_MEDIACODEC_H264_EXACT_NAME");
       const char *canonical = std::getenv("NH_MEDIACODEC_H264_CANONICAL_NAME");
       const char *ndk_codec = std::getenv("NH_MEDIACODEC_H264_NDK_CODEC");
       const char *bitrate_mode = std::getenv("NH_MEDIACODEC_H264_BITRATE_MODE");
+      const char *bridge_port = std::getenv("NH_MEDIACODEC_BRIDGE_PORT");
 
       BOOST_LOG(info) << "mediacodec_h264: requested ffmpeg encoder ["sv << video_format.name << ']';
       BOOST_LOG(info) << "mediacodec_h264: NH_MEDIACODEC_H264_EXACT_NAME=" << (exact ? exact : "<unset>");
       BOOST_LOG(info) << "mediacodec_h264: NH_MEDIACODEC_H264_CANONICAL_NAME=" << (canonical ? canonical : "<unset>");
       BOOST_LOG(info) << "mediacodec_h264: NH_MEDIACODEC_H264_NDK_CODEC=" << (ndk_codec ? ndk_codec : "<unset>");
       BOOST_LOG(info) << "mediacodec_h264: NH_MEDIACODEC_H264_BITRATE_MODE=" << (bitrate_mode ? bitrate_mode : "<unset>");
+      BOOST_LOG(info) << "mediacodec_h264: NH_MEDIACODEC_BRIDGE_PORT=" << (bridge_port ? bridge_port : "<unset>");
       BOOST_LOG(info) << "mediacodec_h264: avcodec probe=" << (codec ? "FOUND" : "NOT FOUND");
     }
 
